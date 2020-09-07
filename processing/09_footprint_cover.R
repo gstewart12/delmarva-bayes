@@ -26,23 +26,18 @@ control <- list(
   grid_width = 50,
   phi = 0.85,
   # Water level of flooded/dry threshold 
-  flood_depth = -0.10
+  flood_depth = 0
 )
 
 # Load the required packages
 devtools::load_all("/Users/Graham/R Projects/footprints")
+devtools::load_all("/Users/Graham/Projects/Flux/dscalr")
 library(progress)
 library(lubridate)
 library(tidyverse)
 
 # Load reference files
-source("/Users/Graham/Desktop/DATA/Flux/tools/reference/site_metadata.R")
-
-# Load functions
-path_funs <- file.path(settings$dir, "Flux/tools/engine/functions")
-source(file.path(path_funs, "flag.R"))
-source(file.path(path_funs, "latest_version.R"))
-source(file.path(path_funs, "utilities.R"))
+source("~/Desktop/DATA/Flux/tools/reference/site_metadata.R")
 
 
 ### Helper functions ===========================================================
@@ -85,8 +80,6 @@ cross_grids <- function(...) {
 }
 
 
-
-
 ### Initialize script settings & documentation =================================
 
 # Load metadata file
@@ -124,7 +117,7 @@ paths <- list(
 )
 
 # Set tag for creating output file names
-tag_out <- create_tag(settings$site, settings$year, settings$date)
+tag_out <- make_tag(settings$site, settings$year, settings$date)
 
 
 ### Load required input data ===================================================
