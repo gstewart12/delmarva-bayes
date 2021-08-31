@@ -8,19 +8,17 @@
 
 # Output(s):
 
-rm(list = ls())
-.rs.restartR()
 settings <- list(
   name = "Graham Stewart", # user who ran the script
   email = "grahamstewart12@gmail.com", # user's email contact
-  site = "JLN", # three letter site code
-  year = 2019, # four digit year
-  dir = "/Users/Graham/Desktop/DATA", # where all data can be found
+  site = "JLR", # three letter site code
+  year = 2018, # four digit year
   date = lubridate::today(), # date script was run
   info = devtools::session_info() # R session info: R, OS, packages
 )
 
-control <- list(
+# TODO: move config to yaml file
+config <- list(
   fp_model = "K15",
   features = c("ndvi", "ndwi", "z_max", "i_vp"),
   grid_width = 50,
@@ -30,14 +28,14 @@ control <- list(
 )
 
 # Load the required packages
-devtools::load_all("/Users/Graham/R Projects/footprints")
-devtools::load_all("/Users/Graham/Projects/Flux/dscalr")
+devtools::load_all("~/Projects/Flux/footprints")
+devtools::load_all("~/Projects/Flux/dscalr")
 library(progress)
 library(lubridate)
 library(tidyverse)
 
 # Load reference files
-source("~/Desktop/DATA/Flux/tools/reference/site_metadata.R")
+source("~/Projects/Flux/towers/reference/site_metadata.R")
 
 
 ### Helper functions ===========================================================
@@ -83,104 +81,122 @@ cross_grids <- function(...) {
 ### Initialize script settings & documentation =================================
 
 # Load metadata file
-md <- purrr::pluck(site_metadata, settings$site)
-elev_corr <- md$rel_elev_well
+md <- yaml::read_yaml(file.path("data", settings$site, "metadata.yml"))
+tower_coords <- c(md$tower$coords$east, md$tower$coords$north)
+elev_corr <- md$well$rel_elev
+
+# Set tag for file names
+tag <- make_tag(md$site_code, settings$year)
 
 # Set the desired working directory in RStudio interface
 # - assumes that the subdirectory structure is already present
-wd <- file.path(settings$dir, "Flux", settings$site, settings$year)
-path_spatial <- file.path(dirname(wd), "analysis", "spatial")
-path_in <- file.path(wd, "processing", "05_footprint")
+path_flux <- file.path(
+  "~/Projects/Flux/towers/data", settings$site, settings$year
+)
+path_spatial <- file.path("data", settings$site, "processing")
+path_in <- file.path(path_flux, "05_footprint")
+path_out <- file.path(path_spatial, "09_footprint_cover")
 
-paths <- list(
-  # Half-hourly water level
+files <- list(
+  # Daily water level
   wtd = file.path(
-    "/Users/Graham/Desktop", "DATA", "PT", "output", settings$site, 
-    paste0(settings$site, "_", settings$year, ".csv")
+    "~/Projects/Flux/inundation/data/output",
+    paste0(str_replace(settings$site, "JL", "F"), "_waterlevel_dd.csv")
   ),
   # Cover type raster
-  class = file.path(path_spatial, "07_classification", "classes_rev.tif"),
+  class = file.path(path_spatial, "07_classification", "classes_manual"),
   # Relative elevation raster
   elev = file.path(path_spatial, "08_relative_elevation", "rel_elev.tif"),
   # Other spatial features
   feat = file.path(path_spatial, "03_feature_extraction"),
-  delin = file.path(dirname(wd), "site_info", "delineation"),
+  delin = file.path(dirname(path_flux), "site_info", "delineation"),
   # Footprint data
-  fp = latest_version(
-    file.path(path_in, "footprint"), paste0("halfhourly_", control$fp_model), ""
+  fp = file.path(
+    path_in, "footprint", paste0("halfhourly_", config$fp_model, "_", tag)
   ),
-  phi = latest_version(
-    file.path(path_in, "stats"), paste0("footprint_stats_", control$fp_model)
-  ),
-  # Output files
-  out = file.path(wd, "processing", "07_footprint_cover", "data")
+  phi = file.path(
+    path_in, "stats", 
+    paste0("footprint_stats_", config$fp_model, "_", tag, ".csv")
+  )
 )
-
-# Set tag for creating output file names
-tag_out <- make_tag(settings$site, settings$year, settings$date)
 
 
 ### Load required input data ===================================================
 
 # Import water level data
-data_wtd <- readr::read_csv(
-  paths$wtd, guess_max = 7000, 
-  col_types = readr::cols(.default = readr::col_guess())
-)
+data_wtd <- read_csv(files$wtd, show_col_types = FALSE)
 
 # Import footprint phi data
-data_phi <- readr::read_csv(
-  paths$phi, guess_max = 7000, 
-  col_types = readr::cols(.default = readr::col_guess())
-)
+data_phi <- read_csv(files$phi, show_col_types = FALSE)
 
 # Import footprint grid (including AOI grid)
-grid <- paths$fp %>% 
+grid <- files$fp %>% 
   file.path("grid") %>%
   file.path(paste0(c("x", "y", "aoi"), ".txt")) %>% 
-  purrr::map(read_matrix, trunc = 0) %>%
-  rlang::set_names(c("x", "y", "aoi"))
-
-# Import classified image
-class <- raster::raster(paths$class)
-class_key <- c("wtr" = 1, "veg" = 2, "frs" = 3)
+  map(read_matrix, trunc = 0) %>%
+  set_names(c("x", "y", "aoi"))
 
 # Import relative elevation
-rel_elev <- raster::raster(paths$elev)
-flood_key <- c("dry" = -1, "wet" = 1)
+rel_elev <- raster::raster(files$elev)
+flood_key <- c(dry = -1, wet = 1)
+
+# Import classified image
+class <- files$class %>%
+  sf::read_sf() %>%
+  transmute(
+    class = if_else(class == "PH", subclass, class),
+    class = if_else(is.na(class), "CA", class),
+    class = factor(str_to_lower(class))
+  )
+
+# Make integer key for classes
+class_key <- class %>% 
+  as_tibble() %>% 
+  distinct(class) %>% 
+  transmute(class = levels(class), id = row_number()) %>%
+  deframe()
 
 # Read all other spatial features
-feat <- paths$feat %>%
+feat <- files$feat %>%
   list.files(pattern = ".tif$", full.names = TRUE, recursive = TRUE) %>%
-  stringr::str_subset(
-    stringr::str_c("/", control$feat, ".", collapse = "|")
-  ) %>%
-  purrr::map(raster::raster) %>%
-  rlang::set_names(purrr::map(., names))
+  str_subset(str_c("/", config$feat, ".", collapse = "|")) %>%
+  map(raster::raster) %>%
+  set_names(map(., names))
 
 
 ### Prepare input data =========================================================
 
+# Convert classified polygons to raster format
+class_rst <- class %>%
+  stars::st_rasterize(dx = 0.6, dy = 0.6) %>%
+  as("Raster")
+
 # Map imagery onto same grid as footprint
-class_grid <- class %>% 
-  snap_to_grid(grid, c(md$x_utm, md$y_utm)) %>%
+class_grid <- class_rst %>% 
+  snap_to_grid(grid, tower_coords) %>%
   with_matrix(~ as.integer(.x))
-elev_grid <- snap_to_grid(rel_elev, grid, c(md$x_utm, md$y_utm))
+
+# z0_grid <- class_grid %>% 
+#   replace(which(class_grid == 3), 0.5) %>% 
+#   replace(which(class_grid == 2), 0.2) %>% 
+#   replace(which(class_grid == 1), 0.01)
+
+elev_grid <- snap_to_grid(rel_elev, grid, tower_coords)
 feat_grid <- feat %>%
-  purrr::map(~ snap_to_grid(.x, grid, c(md$x_utm, md$y_utm))) %>%
-  purrr::prepend(list(rel_elev = elev_grid))
+  map(~ snap_to_grid(.x, grid, tower_coords)) %>%
+  prepend(list(rel_elev = elev_grid))
 
 # Create key for combined cover types & flooding
 classflood_key <- class_key %>% 
-  purrr::map(~ .x * flood_key) %>% 
-  purrr::imap(~ rlang::set_names(.x, stringr::str_c(.y, "_", names(.)))) %>%
-  purrr::flatten() %>%
-  purrr::simplify()
+  map(~ .x * flood_key) %>% 
+  imap(~ set_names(.x, str_c(.y, "_", names(.)))) %>%
+  flatten() %>%
+  simplify()
 
 # Split site grid into objective quadrants
 quad_grid <- with_matrix2(
   sign(grid$x), sign(grid$y), 
-  ~ dplyr::case_when(
+  ~ case_when(
     .x ==  1 & .y ==  1 ~ 1,
     .x == -1 & .y ==  1 ~ 2,
     .x == -1 & .y == -1 ~ 3,
@@ -189,35 +205,35 @@ quad_grid <- with_matrix2(
 )
 quad_key <- c(q1 = 1, q2 = 2, q3 = 3, q4 = 4)
 quad_cover <- quad_grid %>% 
-  with_matrix2(class_grid, ~ forcats::fct_cross(factor(.x), factor(.y))) %>% 
-  with_matrix(~ as.integer(factor(.x))) 
-quadclass_key <- quad_cover %>% 
-  as.vector() %>% unique() %>% sort() %>%
-  rlang::set_names(paste(
-    rep(names(quad_key), each = length(class_key)), names(class_key), 
-    sep = "_"
-  ))
+  with_matrix2(
+    class_grid, 
+    ~ as.integer(fct_cross(factor(.x), factor(.y), keep_empty = TRUE))
+  )
+quadclass_key <- quad_cover %>%
+  as.vector() %>%
+  unique() %>%
+  sort() %>%
+  set_names(
+    paste(names(quad_key), rep(names(class_key), each = 4), sep = "_")[.]
+  )
 
 ### Retrieve footprints, calculate cover =======================================
 
 # Initialize loop
 
 # Get list of footprint files
-fp_files <- paths$fp %>% 
+fp_files <- files$fp %>% 
   file.path("footprints") %>%
   list.files(full.names = TRUE) %>%
-  tibble::enframe(name = NULL, value = "file") %>%
+  enframe(name = NULL, value = "file") %>%
   # Parse timestamps from file names
-  dplyr::mutate(
-    timestamp = file %>% 
-      basename() %>% 
-      stringr::str_sub(1, -5) %>% 
-      lubridate::ymd_hms(),
+  mutate(
+    timestamp = ymd_hms(str_sub(basename(file), 1, -5)),
     .before = 1
   ) %>%
-  tibble::deframe()
+  deframe()
 
-fp_timestamps <- fp_files %>% names() %>% lubridate::ymd_hms()
+fp_timestamps <- fp_files %>% names() %>% ymd_hms()
 
 n_fp <- length(fp_files)
 
@@ -226,11 +242,13 @@ cover <- vctrs::vec_init(list(), n_fp)
 
 # Select water level data 
 wtd <- data_wtd %>%
-  dplyr::right_join(
-    tibble::enframe(fp_timestamps, name = NULL, value = "timestamp"),
-    by = "timestamp"
+  right_join(
+    fp_timestamps %>%
+      enframe(name = NULL, value = "timestamp") %>%
+      mutate(date = date(timestamp)),
+    by = "date"
   ) %>%
-  dplyr::pull(wtd_f)
+  pull(wtd_f)
 p <- progress_info(n_fp)
 
 for (i in 1:n_fp) {
@@ -241,7 +259,7 @@ for (i in 1:n_fp) {
   # Mask integrated footprint to account for rapid expansion approaching 100%
   # - recommended: between 80% and 90% (Kljun et al. 2015)
   # - this means data should be filtered for phi >= p
-  fp_mask <- mask_source_area(fp_temp, p = control$phi, mask_value = 0)
+  fp_mask <- mask_source_area(fp_temp, p = config$phi, mask_value = 0)
   fp_mask <- fp_mask * grid$aoi
   
   # Normalize integrated footprint to 1 (Tuovinen et al. 2019)
@@ -252,10 +270,10 @@ for (i in 1:n_fp) {
   # Calculate water level over AOI
   # - as depth relative to land surface (negative = water below surface)
   # - give wtd a placeholder value if NA so that other covers can be summed
-  aoi_wtd <- md$rel_elev_well + tidyr::replace_na(wtd[i], 0.1) - elev_grid
+  aoi_wtd <- elev_corr + replace_na(wtd[i], 0.1) - elev_grid
   # Classify flooded area (1 = wet, 0 = dry)
   aoi_flooded <- with_matrix(
-    aoi_wtd, ~ dplyr::if_else(.x >= control$flood_depth, 1, 0)
+    aoi_wtd, ~ if_else(.x >= config$flood_depth, 1, 0)
   ) 
   
   # For cover classes, flooded is classified as (1 = wet, -1 = dry)
@@ -271,8 +289,8 @@ for (i in 1:n_fp) {
   wtd_wt <- summarize_cover(fp_norm, aoi_wtd, type = "numeric")
   flood_wt <- summarize_cover(fp_norm, aoi_flooded, type = "numeric")
   feat_wt <- feat_grid %>%
-    purrr::map(~ summarize_cover(fp_norm, .x, type = "numeric")) %>%
-    purrr::simplify()
+    map(~ summarize_cover(fp_norm, .x, type = "numeric")) %>%
+    simplify()
   
   # Add all weights to list 
   cover[[i]] <- c(
@@ -283,73 +301,131 @@ for (i in 1:n_fp) {
   p$tick()
 }
 
-# Gather everything into one data frame (this is very slow)
+# Gather everything into one data frame
 data_cover <- cover %>%
-  dplyr::bind_rows() %>%
-  dplyr::mutate(timestamp = fp_timestamps) %>%
-  dplyr::relocate(timestamp) %>%
-  dplyr::right_join(dplyr::select(data_phi, timestamp), by = "timestamp") %>%
-  dplyr::arrange(timestamp)
+  bind_rows() %>%
+  mutate(timestamp = fp_timestamps) %>%
+  relocate(timestamp) %>%
+  right_join(select(data_phi, timestamp), by = "timestamp") %>%
+  arrange(timestamp)
 
 # Sum crosstabs
-data_cover_all <- data_cover %>%
-  dplyr::left_join(
-    dplyr::select(data_wtd, timestamp, wtd = wtd_f), by = "timestamp"
+data_cover_patch <- data_cover %>% 
+  select(timestamp, ends_with(c("wet", "dry"))) %>% 
+  pivot_longer(-timestamp, names_to = c("patch", "flood"), names_sep = "_") %>% 
+  group_by(timestamp, patch) %>% 
+  summarize(p = sum(value), .groups = "drop") %>% 
+  pivot_wider(names_from = patch, values_from = p) %>%
+  rowwise() %>%
+  mutate(
+    # 3-patch scheme (open water, herbaceous vegetation, forested wetland)
+    wtr = sum(c_across(any_of(c("av", "ow", "pe")))),
+    veg = sum(c_across(any_of(c("ca", "el", "ju", "pa", "hv")))),
+    frs = sum(c_across(any_of(c("fo", "fw")))),
+    # Sedges/rushes
+    sr = sum(c_across(any_of(c("ca", "el", "ju")))),
+    .after = 2
   ) %>%
-  dplyr::mutate(
-    wtr = wtr_wet + wtr_dry,
-    veg = veg_wet + veg_dry,
-    frs = frs_wet + frs_dry,
-    wet = wtr_wet + veg_wet + frs_wet,
-    dry = wtr_dry + veg_dry + frs_dry,
-    q1 = q1_wtr + q1_veg + q1_frs,
-    q2 = q2_wtr + q2_veg + q2_frs,
-    q3 = q3_wtr + q3_veg + q3_frs,
-    q4 = q4_wtr + q4_veg + q4_frs,
-    .after = 1
-  ) %>%
+  ungroup() %>%
+  bind_cols(select(data_cover, phi_mask))
+
+data_cover_flood <- data_cover %>%
+  mutate(date = date(timestamp)) %>%
+  left_join(select(data_wtd, date, wtd = wtd_f), by = "date") %>%
+  select(timestamp, phi_mask, wtd, ends_with(c("wet", "dry"))) %>%
   # Set wet/dry covers to NA if WTD was missing
-  dplyr::mutate(dplyr::across(
-    c(dplyr::ends_with("wet"), dplyr::ends_with("dry")), 
-    ~ dplyr::if_else(is.na(wtd), NA_real_, .x)
-  ))
+  mutate(
+    across(-c(timestamp, phi_mask), ~ if_else(is.na(wtd), NA_real_, .x))
+  ) %>%
+  rowwise() %>%
+  mutate(
+    wet = sum(c_across(ends_with("wet"))),
+    dry = sum(c_across(ends_with("dry")))
+  ) %>%
+  mutate(
+    # 3-patch scheme (open water, herbaceous vegetation, forested wetland)
+    wtr_wet = sum(c_across(any_of(paste0(c("av", "ow", "pe"), "_wet")))),
+    wtr_dry = sum(c_across(any_of(paste0(c("av", "ow", "pe"), "_dry")))),
+    veg_wet = sum(c_across(any_of(paste0(c("ca", "el", "ju", "pa"), "_wet")))),
+    veg_dry = sum(c_across(any_of(paste0(c("ca", "el", "ju", "pa"), "_dry")))),
+    frs_wet = sum(c_across(any_of("fo_wet"))),
+    frs_dry = sum(c_across(any_of("fo_dry"))),
+    # Sedges/rushes
+    sr_wet = sum(c_across(any_of(paste0(c("ca", "el", "ju"), "_wet")))),
+    sr_dry = sum(c_across(any_of(paste0(c("ca", "el", "ju"), "_dry"))))
+  ) %>%
+  ungroup()
+  
+data_cover_quad <- data_cover %>%
+  select(timestamp, phi_mask, starts_with(c("q1", "q2", "q3", "q4"))) %>%
+  rowwise() %>%
+  mutate(
+    q1 = sum(c_across(starts_with("q1"))),
+    q2 = sum(c_across(starts_with("q2"))),
+    q3 = sum(c_across(starts_with("q3"))),
+    q4 = sum(c_across(starts_with("q4")))
+  ) %>%
+  mutate(
+    # 3-patch scheme (open water, herbaceous vegetation, forested wetland)
+    q1_wtr = sum(c_across(any_of(paste0("q1_", c("av", "ow", "pe"))))),
+    q2_wtr = sum(c_across(any_of(paste0("q2_", c("av", "ow", "pe"))))),
+    q3_wtr = sum(c_across(any_of(paste0("q3_", c("av", "ow", "pe"))))),
+    q4_wtr = sum(c_across(any_of(paste0("q4_", c("av", "ow", "pe"))))),
+    q1_veg = sum(c_across(any_of(paste0("q1_", c("ca", "el", "ju", "pa"))))),
+    q2_veg = sum(c_across(any_of(paste0("q2_", c("ca", "el", "ju", "pa"))))),
+    q3_veg = sum(c_across(any_of(paste0("q3_", c("ca", "el", "ju", "pa"))))),
+    q4_veg = sum(c_across(any_of(paste0("q4_", c("ca", "el", "ju", "pa"))))),
+    q1_frs = sum(c_across(any_of("q1_fo"))),
+    q2_frs = sum(c_across(any_of("q2_fo"))),
+    q3_frs = sum(c_across(any_of("q3_fo"))),
+    q4_frs = sum(c_across(any_of("q4_fo"))),
+    # Sedges/rushes
+    q1_sr = sum(c_across(any_of(paste0("q1_", c("ca", "el", "ju"))))),
+    q2_sr = sum(c_across(any_of(paste0("q2_", c("ca", "el", "ju"))))),
+    q3_sr = sum(c_across(any_of(paste0("q3_", c("ca", "el", "ju"))))),
+    q4_sr = sum(c_across(any_of(paste0("q4_", c("ca", "el", "ju")))))
+  ) %>%
+  ungroup()
 
 # Peek distributions
-data_cover_all %>%
-  tidyr::pivot_longer(c(wet, dry)) %>%
-  ggplot2::ggplot(ggplot2::aes(value, fill = name)) +
-  ggplot2::geom_density(na.rm = TRUE, alpha = 0.6)
-
-data_cover_all %>%
-  dplyr::summarize(
-    dplyr::across(c(-timestamp, -phi_mask), sum, na.rm = TRUE)
-  ) %>%
-  tidyr::pivot_longer(dplyr::everything())
+# data_cover_all %>%
+#   pivot_longer(c(wet, dry)) %>%
+#   ggplot(aes(value, fill = name)) +
+#   geom_density(na.rm = TRUE, alpha = 0.6)
+# 
+# data_cover_all %>%
+#   summarize(across(c(-timestamp, -phi_mask), sum, na.rm = TRUE)) %>%
+#   pivot_longer(everything())
 
 # Quadrant weights
-ggplot2::ggplot() + 
-  stars::geom_stars(
-    data = quad_grid %>% 
-      apply(2, rev) %>% t() %>%
-      stars::st_as_stars() %>% 
-      tibble::as_tibble(center = FALSE) %>% 
-      dplyr::left_join(
-        data_cover_all %>% 
-          dplyr::filter(phi_mask > 0.8) %>%
-          dplyr::select(q1, q2, q3, q4) %>% 
-          dplyr::summarize(dplyr::across(.fns = ~ sum(.x, na.rm = TRUE))) %>% 
-          tidyr::pivot_longer(dplyr::everything()) %>%
-          dplyr::mutate(name = as.numeric(stringr::str_remove_all(name, "q"))),
-        by = c("A1" = "name")
-      ) %>% 
-      dplyr::select(-A1) %>% 
-      stars::st_as_stars()
-  ) + 
-  ggplot2::scale_fill_distiller(palette = "Spectral", trans = "log") + 
-  ggplot2::coord_fixed()
+# ggplot() + 
+#   stars::geom_stars(
+#     data = quad_grid %>% 
+#       apply(2, rev) %>% t() %>%
+#       stars::st_as_stars() %>% 
+#       as_tibble(center = FALSE) %>% 
+#       left_join(
+#         data_cover_all %>% 
+#           filter(phi_mask > 0.8) %>%
+#           select(q1, q2, q3, q4) %>% 
+#           summarize(across(.fns = ~ sum(.x, na.rm = TRUE))) %>% 
+#           pivot_longer(everything()) %>%
+#           mutate(name = as.numeric(str_remove_all(name, "q"))),
+#         by = c("A1" = "name")
+#       ) %>% 
+#       select(-A1) %>% 
+#       stars::st_as_stars()
+#   ) + 
+#   scale_fill_distiller(palette = "Spectral", trans = "log") + 
+#   coord_fixed()
 
 # Write output to file
-covers_out <- file.path(paths$out, paste0("footprint_cover_", tag_out, ".csv"))
-readr::write_csv(data_cover_all, covers_out)
+patch_out <- file.path(path_out, paste0("footprint_cover_patch_", tag, ".csv"))
+flood_out <- file.path(path_out, paste0("footprint_cover_flood_", tag, ".csv"))
+quad_out <- file.path(path_out, paste0("footprint_cover_quad_", tag, ".csv"))
+
+write_csv(data_cover_patch, patch_out)
+write_csv(data_cover_flood, flood_out)
+write_csv(data_cover_quad, quad_out)
 
 
